@@ -6,6 +6,23 @@ import helmet from "helmet";
 import rateLimit from 'express-rate-limit';
 import 'dotenv/config';
 
+const requestLogger = (req, res, next) => {
+  req.requestTime = new Date().toISOString();
+  req.requestId = Math.random().toString(36).substring(7);
+  
+  // Log incoming request
+  console.log({
+    timestamp: req.requestTime,
+    request_id: req.requestId,
+    type: 'REQUEST',
+    endpoint: req.path,
+    method: req.method,
+    payload: req.body
+  });
+  
+  next();
+};
+
 const requiredEnvVars = ['DATABASE_URL', 'USER_SERVICE_URL'];
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
@@ -22,6 +39,7 @@ const USER_URL = process.env.USER_SERVICE_URL;
 app.use(helmet());
 app.use(bodyParser.json({ limit: '10kb' }));
 
+app.use(requestLogger);
 
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
@@ -61,15 +79,42 @@ const validateOrderInput = (req, res, next) => {
 
 app.post("/order", validateOrderInput, async (req, res) => {
   const { user_id, order_details } = req.body;
+  const { requestId, requestTime } = req;
 
   try {
+    // Log user check
+    console.log({
+      timestamp: new Date().toISOString(),
+      request_id: requestId,
+      type: 'PROCESS',
+      step: 'Checking user existence',
+      user_id
+    });
+
     const user = await prisma.user.findUnique({
       where: { id: user_id }
     });
 
     if (!user) {
-      return res.status(404).json({ error: "User not found" });
+      const response = { error: "User not found" };
+      console.log({
+        timestamp: new Date().toISOString(),
+        request_id: requestId,
+        type: 'RESPONSE',
+        status: 404,
+        body: response
+      });
+      return res.status(404).json(response);
     }
+
+    // Log order creation
+    console.log({
+      timestamp: new Date().toISOString(),
+      request_id: requestId,
+      type: 'PROCESS',
+      step: 'Creating order',
+      user_id
+    });
 
     const newOrder = await prisma.orders.create({
       data: {
@@ -78,50 +123,91 @@ app.post("/order", validateOrderInput, async (req, res) => {
       },
     });
 
-    if (process.env.NODE_ENV === 'development') {
-      console.info(`Created order ${newOrder.order_id} for user ${user_id}`);
-    }
-
     try {
+      // Log notification attempt
+      console.log({
+        timestamp: new Date().toISOString(),
+        request_id: requestId,
+        type: 'PROCESS',
+        step: 'Sending notification',
+        order_id: newOrder.order_id
+      });
+
       await axios.post(USER_URL, {
         user_id,
         message: "Your order has been placed successfully!",
       });
 
-      return res.status(201).json({ 
+      const response = { 
         order_id: newOrder.order_id,
         message: "Order placed and user notified"
-      });
-    } catch (notifyError) {
-      console.error('Notification service error:', {
-        error_name: notifyError.name,
-        error_message: notifyError.message,
-        stack: process.env.NODE_ENV === 'development' ? notifyError.stack : undefined
+      };
+
+      // Log successful response
+      console.log({
+        timestamp: new Date().toISOString(),
+        request_id: requestId,
+        type: 'RESPONSE',
+        status: 201,
+        body: response
       });
 
-      return res.status(201).json({ 
+      return res.status(201).json(response);
+    } catch (notifyError) {
+      // Log notification error
+      console.error({
+        timestamp: new Date().toISOString(),
+        request_id: requestId,
+        type: 'ERROR',
+        step: 'Notification failed',
+        error: {
+          name: notifyError.name,
+          message: notifyError.message
+        }
+      });
+
+      const response = { 
         order_id: newOrder.order_id,
         message: "Order created but notification failed"
+      };
+
+      console.log({
+        timestamp: new Date().toISOString(),
+        request_id: requestId,
+        type: 'RESPONSE',
+        status: 201,
+        body: response
       });
+
+      return res.status(201).json(response);
     }
   } catch (error) {
-    console.error('Error processing order:', {
-      error_name: error.name,
-      error_message: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    // Log processing error
+    console.error({
+      timestamp: new Date().toISOString(),
+      request_id: requestId,
+      type: 'ERROR',
+      step: 'Order processing',
+      error: {
+        name: error.name,
+        message: error.message
+      }
     });
 
-    if (error instanceof Prisma.PrismaClientKnownRequestError) {
-      return res.status(400).json({ 
-        error: "Database operation failed",
-        code: error.code
-      });
-    }
+    const response = error instanceof Prisma.PrismaClientKnownRequestError 
+      ? { error: "Database operation failed", code: error.code }
+      : { error: "Internal server error" };
 
-    return res.status(500).json({ 
-      error: "Internal server error",
-      request_id: req.id
+    console.log({
+      timestamp: new Date().toISOString(),
+      request_id: requestId,
+      type: 'RESPONSE',
+      status: error instanceof Prisma.PrismaClientKnownRequestError ? 400 : 500,
+      body: response
     });
+
+    return res.status(error instanceof Prisma.PrismaClientKnownRequestError ? 400 : 500)
+      .json(response);
   }
 });
 
